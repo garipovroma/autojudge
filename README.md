@@ -6,7 +6,7 @@ Official PyTorch implementation for the paper `AutoJudge: Judge Decoding Without
 
 ## 🚀 Running the code
 
-Our approach introduces an algorithm for automatically identifying important token mismatches in model generations. We extract hidden states for these mismatches, train a lightweight classifier to detect them, and use it to evaluate model outputs—without relying on manual annotations.
+Our approach introduces an algorithm for automatically identifying important token mismatches in model generations. We extract hidden states for these tokens, train a lightweight classifier to detect them, and employ it during inference.
 
 To reproduce our results, follow these steps:
 
