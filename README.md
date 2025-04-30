@@ -14,7 +14,7 @@ To obtain results using our approach you need to:
 3. Train a classifier
 4. Run evaluations
 
-** 📦 Mined datasets will be published on HuggingFace shortly, so you can skip first two steps once released! **
+**📦 Mined datasets will be published on HuggingFace shortly, so you can skip first two steps once released!**
 
 ### 🛠️ Getting started
 
