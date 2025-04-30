@@ -6,12 +6,13 @@ Official PyTorch implementation for the paper `AutoJudge: Judge Decoding Without
 
 ## 🚀 Running the code
 
-Our work proposes an algorithm to mine important token mismatches dataset. We calculate hidden states for them, train a lightweight classifier on them and then do evaluations.
+Our approach introduces an algorithm for automatically identifying important token mismatches in model generations. We extract hidden states for these mismatches, train a lightweight classifier to detect them, and use it to evaluate model outputs—without relying on manual annotations.
 
-To obtain results using our approach you need to:
-1. Run dataset mining script
-2. Run hidden states collection script
-3. Train a classifier
+To reproduce our results, follow these steps:
+
+1. Run the dataset mining script
+2. Calculate hidden states
+3. Train the classifier
 4. Run evaluations
 
 **📦 Mined datasets will be published on HuggingFace shortly, so you can skip first two steps once released!**
