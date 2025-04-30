@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=0 python src/calc_hiddens.py \
     --save_freq $SAVE_FREQ \
     --n_processes $N_PROCESSES \
     --process_id 0 &
-CUDA_VISIBLE_DEVICES=0 python src/calc_hiddens.py \
+CUDA_VISIBLE_DEVICES=1 python src/calc_hiddens.py \
     --draft_model $MODEL0 \
     --target_model $MODEL1 \
     --torch_dtype $TORCH_DTYPE \
