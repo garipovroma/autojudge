@@ -165,14 +165,12 @@ def find_important_tokens(
 
     return dict(changed_token_indices=changed_token_indices, colored_tokens=colored_tokens, draft_answer=draft_answer, target_answer=target_answer, current_response=current_response, responses=responses)
 
-
 def extract_answer_v2(s, tokenizer):
     left, right = find_answer(s, tokenizer)
     answer_str = tokenizer.batch_decode(s[:, left:right], skip_special_tokens=True)[0]
     extracted_answer = extract_answer(answer_str)
     
     return extracted_answer
-
 
 def extract_answer(s, suffix='<|eot_id|>'):
     s = s.lower().replace(suffix, '').replace('the final answer is', '=')
@@ -212,7 +210,7 @@ def get_args():
                         help='Output folder name.')
     parser.add_argument('--output_file', type=str, default='important_tokens',
                         help='Output file name.')
-    parser.add_argument('--num_shots', type=int, default=8,
+    parser.add_argument('--num_shots', type=int, default=0,
                         help='Number of shots to use.')
     parser.add_argument('--world_size', type=int, default=1,
                         help='world size')
@@ -293,11 +291,6 @@ if __name__ == "__main__":
     else:
         important_tokens_data = []
         logger.info(f'No important tokens found in {output_file_path}, will generate them')
-
-    if 'NV_YT_OPERATION_ID' in os.environ:
-        logger.info(f'NY_YT_OPERATION_ID found in os.environ')
-    else:
-        logger.info(f'NY_YT_OPERATION_ID not found in os.environ')
 
     with tqdm(total=shard_end - shard_start) as pbar:
         pbar.update(len(important_tokens_data))

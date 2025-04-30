@@ -6,3 +6,5 @@ pandas
 rpyc==6.0.1
 tqdm
 termcolor
+accelerate
+datasets

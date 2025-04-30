@@ -239,11 +239,6 @@ if __name__ == '__main__':
         mined_data = []
         logger.info(f'No important tokens found in {output_file_path}, will generate them')
 
-    if 'NV_YT_OPERATION_ID' in os.environ:
-        logger.info(f'NY_YT_OPERATION_ID found in os.environ')
-    else:
-        logger.info(f'NY_YT_OPERATION_ID not found in os.environ')
-
     mined_data = []
     sample_idx = 0
     with tqdm(total=shard_end - shard_start) as pbar:
