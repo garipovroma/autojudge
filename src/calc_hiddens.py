@@ -111,8 +111,8 @@ if __name__ == '__main__':
     for sample_idx in tqdm(range(n_samples), total=n_samples, desc=f'Process {args.process_id}/{args.n_processes}'):
         sample_dict = data[sample_idx]
 
-        token_ids = sample_dict['current_response']
         for mismatch_idx, (changed_token_pos, importance, target_token, draft_token) in enumerate(data[sample_idx]['changed_token_indices']):
+            token_ids = sample_dict['current_response'].clone()
             orig_token = token_ids[:, changed_token_pos].item()
             replacement_token = draft_token
 
@@ -120,7 +120,8 @@ if __name__ == '__main__':
             tokens_to_encode.append(token_ids.clone())
             text_sample_ids.append(sample_idx)
             mismatch_ids.append(mismatch_idx)
-            
+
+            token_ids = sample_dict['current_response'].clone()
             token_ids[:, changed_token_pos] = target_token
             tokens_to_encode.append(token_ids.clone())
             text_sample_ids.append(sample_idx)
