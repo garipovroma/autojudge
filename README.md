@@ -1,7 +1,13 @@
-# AutoJudge: Judge Decoding Without Manual Annotation
+<div align="center">
+  <h1>AutoJudge: Judge Decoding Without Manual Annotation</h1>
+  [<a href="https://arxiv.org/abs/2504.20039">📚 Paper</a>] |
+  [<a href="https://huggingface.co/datasets/mightyneighbor/Autojudge">🤗 Datasets</a>]
+</div>
 
-<a href='https://arxiv.org/abs/2504.20039'><img src='https://img.shields.io/badge/ArXiv-PDF-red' height="25"></a> &nbsp; 
 
+ &nbsp;
+
+ 
 Official PyTorch implementation for the paper `AutoJudge: Judge Decoding Without Manual Annotation`
 
 ## 🚀 Running the code
@@ -15,8 +21,7 @@ To reproduce our results, follow these steps:
 3. Train the classifier
 4. Run evaluations
 
-🤗 **Mined datasets available:** preprocessed GSM8K & LiveCodeBench artifacts for the most-compute-intensive stages (Dataset mining & Calculating hidden states) are hosted on Hugging Face at [mightyneighbor/Autojudge](https://huggingface.co/datasets/mightyneighbor/Autojudge), so you can skip first two steps for these setups!
-
+🤗 **Mined datasets available:** preprocessed GSM8K & LiveCodeBench artifacts for the most compute-intensive stages (Dataset Mining & Hidden States Calculating) are available at Hugging Face [mightyneighbor/Autojudge](https://huggingface.co/datasets/mightyneighbor/Autojudge), so you can skip the first two steps for these setups!
 
 ### 🛠️ Getting started
 
