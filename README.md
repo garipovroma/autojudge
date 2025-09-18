@@ -15,7 +15,8 @@ To reproduce our results, follow these steps:
 3. Train the classifier
 4. Run evaluations
 
-**📦 Mined datasets will be published on HuggingFace shortly, so you can skip first two steps once released!**
+🤗 **Mined datasets available:** preprocessed GSM8K & LiveCodeBench artifacts for the most-compute-intensive stages (Dataset mining & Calculating hidden states) are hosted on Hugging Face at [mightyneighbor/Autojudge](https://huggingface.co/datasets/mightyneighbor/Autojudge), so you can skip first two steps for these setups!.
+
 
 ### 🛠️ Getting started
 
