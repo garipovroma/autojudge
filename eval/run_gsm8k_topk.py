@@ -17,13 +17,19 @@ import transformers
 import numpy as np
 
 from joblib import dump
-import logging
+import yaml
 
-from src.livecodebench_v5 import load_code_generation_dataset, extract_code, apply_llama_lcb_prompt_format, codegen_metrics, unpack_lcb_data
+from src.core_utils import extract_answer, extract_float
+from generation_utils import run_spec_dec_top_k
 
-from generation_utils import run_spec_dec
+import sys
+sys.path.append('.')
+
+from lm_eval_utils import GSM8KParser, GSM8KEvaluator
+from prompts import GSM8KPrompts, llama_assistant_turn_end
 
 
+# TODO add args
 def parse_args():
     parser = argparse.ArgumentParser(description="Eval baselines")
     parser.add_argument(
@@ -48,7 +54,7 @@ def parse_args():
         "--save_folder",
         type=str,
         default='.',
-        help='Results will be written to "args.eval_folder/evals_data/limo/exp_name"'
+        help='Results will be written to "args.eval_folder/evals_data/limo/exp_name".'
     )
     parser.add_argument(
         "--dump_snapshot_freq",
@@ -67,52 +73,28 @@ def parse_args():
     parser.add_argument("--draft_model", default='meta-llama/Llama-3.2-1B-Instruct')
     parser.add_argument("--target_model", default='meta-llama/Llama-3.1-8B-Instruct')
     parser.add_argument("--torch_dtype", default='float32')
+    parser.add_argument("--num_shots", default=0, type=int, choices=[0, 8])
 
-    parser.add_argument("--head_path")
-    parser.add_argument
+    parser.add_argument("--gsm8k_test_path")
 
     parser.add_argument("--random_seed", default=42, type=int)
     parser.add_argument("--max_new_tokens", default=2048, type=int)
     parser.add_argument("--window_size", default=16, type=int)
-    parser.add_argument("--head_threshold", type=float)
-    parser.add_argument("--setup", default='DD-DT')
-    parser.add_argument('--n_tasks', type=int, default=880)
-    parser.add_argument('--num_process_evaluate', type=int, default=64)
-    parser.add_argument('--lcb_path', type=str, default='none')
-    parser.add_argument('--fold_id', type=int, default=0)
-    parser.add_argument("--split_path", type=str)
+    parser.add_argument("--K", type=int, default=1)
+    parser.add_argument("--setup", default='DD-DT', choices=['DD-DT', 'DT'])
 
-    return parser.parse_args()
-
-
-def load_head(args: 'args_dataclass'):
-    checkpoints = pd.read_pickle(args.head_path)
-    checkpoint_dict = checkpoints[args.fold_id]
-    head = checkpoint_dict['model']
-    scaler = checkpoint_dict['scaler']
-
-    # NOTE for the case with 2 tokens
-    if args.setup == "DD-DT":
-        scaler.mean_ = scaler.mean_[:2048 * 3]
-        scaler.scale_ = scaler.scale_[:2048 * 3]
-        scaler.n_features_in_ = 2048 * 3
-    elif args.setup == "DD-DT-TD":
-        scaler.mean_ = scaler.mean_[:2048 * 3 + 2048]
-        scaler.scale_ = scaler.scale_[:2048 * 3 + 2048]
-        scaler.n_features_in_ = 2048 * 3 + 2048
-    else:
-        raise NotImplementedError(f"Setup {args.setup} isn't currently supported")
-
-    return head, scaler
+    args = parser.parse_args()
+    args.bench_name = 'GSM8K'
+    return args
 
 
 
-def load_models(args: 'args_dataclass', device: torch.device):
+def load_models(args, device: torch.device):
     draft_model = transformers.AutoModelForCausalLM.from_pretrained(
-        args.draft_model, torch_dtype=args.torch_dtype, device_map=device, low_cpu_mem_usage=True)
+        args.draft_model, torch_dtype=args.torch_dtype, device_map='auto', low_cpu_mem_usage=True)
 
     target_model = transformers.AutoModelForCausalLM.from_pretrained(
-        args.target_model, torch_dtype=args.torch_dtype, device_map=device, low_cpu_mem_usage=True)
+        args.target_model, torch_dtype=args.torch_dtype, device_map='auto', low_cpu_mem_usage=True)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.target_model, padding_side='left')
     tokenizer.pad_token_id = 128004  # <|finetune_right_pad_id|>
@@ -120,22 +102,87 @@ def load_models(args: 'args_dataclass', device: torch.device):
     return draft_model, target_model, tokenizer
 
 
-def test_program(program_tokens, eval_samples, tokenizer):
-    code = extract_code(tokenizer.batch_decode(program_tokens)[0])
-    result = codegen_metrics([eval_samples], [[code]], num_process_evaluate=args.num_process_evaluate)
-    score = int(result[0]['pass@1'])
-    return dict(score=score, code=code, gen=tokenizer.batch_decode(program_tokens)[0], result=result)
+def load_questions(args):
+    with open(args.gsm8k_test_path) as f:
+        gsm_questions = [json.loads(line) for line in f]
 
-def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model, draft_model, tokenizer, scaler, head, args: 'args_dataclass', eval_sample):
-    batch_input_ids = tokenizer(question_sample, add_special_tokens=False, return_tensors='pt').to(device)['input_ids']
-    run_stats = run_spec_dec(batch_input_ids, target_model, draft_model, tokenizer, scaler, head, args, setup=args.setup)
+    gsm_questions = [
+        {
+            'question': question_dict['question'],
+            'answer': question_dict['answer'][question_dict['answer'].rfind('#### ') + 5:]
+        }
+        for question_dict in gsm_questions
+    ]
+
+    return gsm_questions
+
+def sample_to_tokens(question_sample, tokenizer, device, args):
+    question = question_sample['question']
+    prompt_with_shots = GSM8KPrompts.prompt_with_0_shots if args.num_shots == 0 else GSM8KPrompts.prompt_with_8_shots
+    prompt = prompt_with_shots + question + "\n" + GSM8KPrompts.formatting_prompt + llama_assistant_turn_end
+    batch_input_ids = tokenizer(prompt, return_tensors='pt', add_special_tokens=False)['input_ids'].to(device)
+
+    return batch_input_ids
+
+
+def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model, draft_model, tokenizer, K, args):
+    batch_input_ids = sample_to_tokens(question_sample, tokenizer, device, args)
+    # this comes from eagle branch
+    ##### FAST REBUTTAL QWEN PATCH START #####
+    if 'qwen' in args.target_model.lower():
+        print(f'Applying QWEN quick-patch', file=sys.stderr)
+        tokenizer.bos_token_id = tokenizer.eos_token_id # based on: https://huggingface.co/Qwen/Qwen2-7B-Instruct/discussions/15
+        with open("data/qwens/gsm8k-cot-llama.yaml", "r") as f:
+            config = yaml.safe_load(f)
+        fewshot_samples = config.get("fewshot_config", {}).get("samples", [])
+        format_prompt = (
+            "Given the following problem, reason and give a final answer to the problem.\n"
+            "Problem: {question}\n"
+            'Your response should end with "The final answer is [answer]" where [answer] is the response to the problem.'
+        )
+        few_shot_turns = []
+        for sample in fewshot_samples:
+            question = sample["question"]
+            target = sample["target"]
+
+            formatted_question = format_prompt.format(question=question)
+
+            few_shot_turns.append({
+                "role": "user",
+                "content": formatted_question,
+            })
+            few_shot_turns.append({
+                "role": "assistant",
+                "content": target,
+            })
+        gsm_prompt_start = "Given the following problem, reason and give a final answer to the problem.\nProblem:"
+        prompt = gsm_prompt_start + " " + question_sample["question"] + "\n" + GSM8KPrompts.formatting_prompt
+
+        batch_input_ids = tokenizer.apply_chat_template(
+            few_shot_turns + \
+            [{'role': 'user', 'content': prompt}]
+        , return_tensors='pt', add_generation_prompt=True, tokenize=True).to(device)
+    else:
+        print(f'NOT applying QWEN quick-patch', file=sys.stderr)
+    ##### FAST REBUTTAL QWEN PATCH END #####
+    run_stats = run_spec_dec_top_k(batch_input_ids, target_model, draft_model, tokenizer, K, args)
 
     generation = run_stats['current_gen']
 
-    generation_str = tokenizer.batch_decode(generation)[0]
+    generations = tokenizer.batch_decode(generation) # 1-length list
+    generation_str = generations[0]
+
+    parser = GSM8KParser()
+    evaluator = GSM8KEvaluator()
+    answer = [question_sample['answer']]
+
+    verdict = bool(evaluator(generations=generations, references=answer) == 1.0)
+
+    answer_float = question_sample['answer']
+    raw_pred = parser(generations)
+    pred_float = raw_pred
 
     gen_tokens = generation.shape[-1] - batch_input_ids.shape[-1]
-    verdict = test_program(generation, eval_sample, tokenizer)['score']
 
     target_calls = run_stats['target_calls']
     draft_calls = run_stats['draft_calls']
@@ -147,8 +194,12 @@ def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model
 
     stats_dict = {
             'idx': sample_idx,
-            'question': question_sample,
+            'question': question_sample['question'],
+            'raw_answer': question_sample['answer'],
             'input_tokens': batch_input_ids.cpu(),
+            'answer': answer_float,
+            'raw_pred': raw_pred,
+            'pred': pred_float,
             'tp': verdict,
             'gen_tokens': gen_tokens,
             't_ratio': round(target_calls / gen_tokens, 4) if gen_tokens else 0,
@@ -162,26 +213,18 @@ def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model
             'raw_accepts_levi': accepts_levi,
             'mismatches': mismatches,  # keeping only first mismatch in the drafting window,
             'generation_str': generation_str,
-            'thr': args.head_threshold,
+            'k': args.K,
         }
     return stats_dict
-    
-def load_folds(args):
-    folds = torch.load(args.split_path)
-    folds = [set(i) for i in folds]
-    return folds
 
-def filter_by_ids(dataset, ids):
-    filtered_dataset = [i for i in dataset if i.question_id in ids]
-    return filtered_dataset
-
-def main():
+def main(args):
     rank = get_worker_rank()
     device = torch.device('cuda')  # gpu_parallel already sets CUDA_VISIBLE_DEVICES for you
     logger = init_worker_logger()
     logger.info(f'The script was run in the following way:')
-    logger.info(f"python {__file__} \\\n" + "\n".join(f"\t\t--{k} {v} \\" for k, v in vars(args).items()))
+    logger.info(f"python {__file__} \\\n" + "\n".join(f"\t\t--{k} {v} \\" for k, v in vars(args).items() if k != 'bench_name'))
     logger.info(f'Output directory: {args.save_folder}')
+    logger.info(f'{os.environ["CUDA_VISIBLE_DEVICES"]=}')
 
     if not os.path.exists(args.save_folder):
         os.makedirs(args.save_folder, exist_ok=True)
@@ -191,19 +234,10 @@ def main():
 
     logger.info('Loading model and tokenizer')
     draft_model, target_model, tokenizer = load_models(args, device)
-    logger.info('Loading dataset')
-    dataset = load_code_generation_dataset(args)
-    logger.info(f'Loading {args.split_path}')
-    split_ids = load_folds(args)[args.fold_id]
-
-    dataset = filter_by_ids(dataset, split_ids)
-
-    livecodebench_v5_dataset, livecodebench_v5_inputs_outputs = unpack_lcb_data(dataset, tokenizer)
-
+    dataset = load_questions(args)
     local_tasks_solved = 0
 
-    head, scaler = load_head(args)
-    np.random.seed(args_dataclass.random_seed)
+    np.random.seed(args.random_seed)
 
     def _run_task(idx: int):
         nonlocal local_tasks_solved
@@ -212,8 +246,7 @@ def main():
             return  # already solved by previous attempt and saved in snapshot
 
         ######### EXAMPLE CODE ###########
-        question_sample = livecodebench_v5_dataset[idx]['prompt']
-        eval_sample = livecodebench_v5_inputs_outputs[idx]
+        question_sample = dataset[idx]
 
         task_report = run_spec_dec_collect_stats(
             sample_idx=idx,
@@ -222,10 +255,8 @@ def main():
             target_model=target_model,
             draft_model=draft_model,
             tokenizer=tokenizer,
-            scaler=scaler,
-            head=head,
-            args=args_dataclass,
-            eval_sample=eval_sample
+            K=args.K,
+            args=args,
         )
 
         with open(task_output_path, "wb") as f_write:
@@ -237,7 +268,7 @@ def main():
 
     if args.start is not None and args.end is not None and args.queue is None:
         logger.info(f'Generating tasks [{args.start}; {args.end})')
-        for idx in tqdm(range(args.start, args.end), desc=f'Process {rank}', total=args.end-args.start+1):
+        for idx in tqdm(range(args.start, args.end), desc=f'Process {rank}', total=args.end-args.start):
             _run_task(idx)
     elif args.queue is not None:
         logger.info(f'Generating tasks from {args.queue}')
@@ -252,20 +283,4 @@ def main():
 if __name__ == "__main__":
     args = parse_args()
 
-    class args_dataclass:
-        draft_model = args.draft_model
-        target_model = args.target_model
-        torch_dtype = args.torch_dtype
-        random_seed = args.random_seed
-        max_new_tokens = args.max_new_tokens
-        window_size = args.window_size
-        head_threshold = args.head_threshold
-        head_path = args.head_path
-        setup = args.setup
-        split_path = args.split_path
-        n_tasks = args.n_tasks
-        num_process_evaluate = args.num_process_evaluate
-        lcb_path = args.lcb_path
-        fold_id = args.fold_id
-
-    main()
+    main(args)

@@ -24,6 +24,8 @@ from types import ModuleType
 from enum import Enum
 from decimal import Decimal
 import time
+import os
+
 
 import_string = "from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\nfrom heapq import *\nfrom bisect import *\nfrom copy import *\nfrom math import *\nfrom random import *\nfrom statistics import *\nfrom itertools import *\nfrom functools import *\nfrom operator import *\nfrom io import *\nfrom sys import *\nfrom json import *\nfrom builtins import *\nfrom typing import *\nimport string\nimport re\nimport datetime\nimport collections\nimport heapq\nimport bisect\nimport copy\nimport math\nimport random\nimport statistics\nimport itertools\nimport functools\nimport operator\nimport io\nimport sys\nimport json\nsys.setrecursionlimit(50000)\n"
 
@@ -482,6 +484,11 @@ def reliability_guard(maximum_memory_bytes=None):
     Codex paper for more information about OpenAI's code sandbox, and proceed
     with caution.
     """
+    _max_memory_bytes_env = os.environ.get("LCB_MAX_MEMORY_BYTES")
+    if _max_memory_bytes_env is not None and _max_memory_bytes_env.isdigit():
+        maximum_memory_bytes = int(_max_memory_bytes_env)
+
+    print(f"{maximum_memory_bytes=}")
 
     if maximum_memory_bytes is not None:
         import resource
@@ -504,7 +511,6 @@ def reliability_guard(maximum_memory_bytes=None):
     # builtins.exit = None
     builtins.quit = None
 
-    import os
 
     os.environ["OMP_NUM_THREADS"] = "1"
 

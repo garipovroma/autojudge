@@ -1,16 +1,18 @@
 import argparse
+from typing import Union, Sequence, Tuple, Dict
 import json
 import os
-
+import re
 
 import time
 from tqdm.auto import tqdm
-
+from termcolor import colored
 import numpy as np
-
+import pandas as pd
 
 import torch
-
+from torch import nn
+import torch.nn.functional as F
 import transformers
 import itertools
 import logging
@@ -18,23 +20,13 @@ import yaml
 
 from time import perf_counter
 
-from core_utils import color_replaced_tokens
+from core_utils import color_replaced_tokens, make_config, pairwise_judgment
 
 import sys
 sys.path.append('.')
 
-from lm_eval_utils import GSM8KParser, GSM8KEvaluator
-from prompts import GSM8KPrompts, llama_assistant_turn_end
-
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-logger = logging.getLogger(__name__)
-
 LAST_DUMP = perf_counter()
-DUMP_FREQ_SECS = 20 * 60  # mins
+DUMP_FREQ_SECS = 30 * 60  # mins
     
 @torch.no_grad()
 def find_important_tokens(
@@ -42,15 +34,15 @@ def find_important_tokens(
     tokenizer: transformers.PreTrainedTokenizer,
     draft_model: transformers.AutoModelForCausalLM,
     target_model: transformers.AutoModelForCausalLM,
+    logger: logging.Logger,
+    question: Dict,
+    config: Dict,
+    args: argparse.Namespace
 ):
 
     global LAST_DUMP, DUMP_FREQ_SECS
 
-    parser = GSM8KParser()
-    evaluator = GSM8KEvaluator()
-
     batch_size, n_input_tokens = prompt.shape
-
     assert batch_size == 1
 
     device = prompt.device
@@ -65,7 +57,7 @@ def find_important_tokens(
         do_sample=False,
         temperature=None,
         top_p=None,
-        max_new_tokens=args.max_new_tokens,
+        max_new_tokens=args.max_new_tokens
     )
 
     draft_response = draft_model.generate(
@@ -73,16 +65,26 @@ def find_important_tokens(
         do_sample=False,
         temperature=None,
         top_p=None,
-        max_new_tokens=args.max_new_tokens,
+        max_new_tokens=args.max_new_tokens
     )
 
-    target_gen_str = tokenizer.batch_decode(target_response)
-    target_ref_ans = parser(target_gen_str)
+    target_gen_str = tokenizer.batch_decode(target_response[:, n_input_tokens:], skip_special_tokens=True)[0]
+    draft_gen_str = tokenizer.batch_decode(draft_response[:, n_input_tokens:], skip_special_tokens=True)[0]
 
-    draft_gen_str = tokenizer.batch_decode(draft_response)
+    # logger.info(f"target_gen_str={target_gen_str}")
+    # logger.info(f"draft_gen_str={draft_gen_str}")
 
-    draft_ans = parser(draft_gen_str)
-
+    draft_vs_target_judgment = pairwise_judgment(
+        question=question, 
+        answer_a=draft_gen_str, 
+        answer_b=target_gen_str,
+        config=config,
+        model=args.judge_model,
+        temperature=args.judge_temperature,
+        max_tokens=args.judge_max_tokens,
+        best_of_n=args.best_of_n
+    )
+    logger.info(f"judgment['score']={draft_vs_target_judgment['score']}, A is draft, B is target")
 
     current_response = target_response  # to be updated by algorithm
 
@@ -92,18 +94,34 @@ def find_important_tokens(
 
     responses = [current_response.cpu().clone()]
     
+    gen_lens = []
+
+    target_token_is_important_verdicts = set([
+        "A<B",
+        "A<<B",
+        "B>A",
+        "B>>A",
+        "None"
+    ])
+
+    judgments = []
+
     for iteration in itertools.count():
         draft_argmax_tokens = torch.cat([torch.tensor([[tokenizer.bos_token_id]], device=device), 
                                   draft_model.forward(input_ids=current_response, attention_mask=torch.ones_like(current_response)).logits.argmax(-1)[:, :-1]], dim=1)
-
+        logger.info(f'{current_response.shape=}, {draft_argmax_tokens.shape=}')
         is_mismatch = current_response != draft_argmax_tokens  # [batch_size=1, max_length]
         mismatch_indices = sorted([idx for idx in is_mismatch.flatten().nonzero().flatten().tolist() if idx >= left_border])
+        if len(mismatch_indices) > 230:
+            logger.info(f'Skipping, too much mismatches = {len(mismatch_indices)}')
+            return dict(skip=True)
         if not mismatch_indices:
             break
 
         colored_tokens = color_replaced_tokens(current_response, draft_argmax_tokens, n_input_tokens, changed_token_indices, tokenizer)
-
         mismatch_index = mismatch_indices[0]
+        
+        logging.info(f'Iteration {iteration}, {mismatch_index=}')
 
         prefix_with_draft_token = torch.cat([
               current_response[:, :mismatch_index],
@@ -121,38 +139,47 @@ def find_important_tokens(
             top_p=None,
             max_new_tokens=max(1, args.max_new_tokens - (alternative_batch['input_ids'].shape[1] - n_input_tokens)),
         )
-
         if tokenizer.eos_token_id in alternative_response[:, n_input_tokens:mismatch_index + 1]:
             eos_pos = (alternative_response[:, n_input_tokens:mismatch_index + 1] == tokenizer.eos_token_id).nonzero(as_tuple=True)[1][-1].item() + n_input_tokens
             logger.info(f'\t\t\t EOS found at {eos_pos=}')
             alternative_response = alternative_response[:, :eos_pos + 1]
 
-        alternative_gen_str = tokenizer.batch_decode(alternative_response)
-        answers_match = evaluator(generations=alternative_gen_str, references=target_ref_ans) == 1.0
-        alt_ans = parser(alternative_gen_str)
-        draft_argmax_token = draft_argmax_tokens[:, mismatch_index].item()
-        target_token = current_response[0, mismatch_index].item()
-        logger.info(f'\t\t{mismatch_index=}, {len(mismatch_indices)=}, {draft_argmax_token=}, {target_token=},  {answers_match=}, {alt_ans=}, {target_ref_ans=}')
-        if answers_match:
+        alternative_gen_str = tokenizer.batch_decode(alternative_response[:, n_input_tokens:], skip_special_tokens=True)[0]
+        current_gen_str = tokenizer.batch_decode(current_response[:, n_input_tokens:], skip_special_tokens=True)[0]
+
+        judgment = pairwise_judgment(
+            question=question, 
+            answer_a=alternative_gen_str, 
+            answer_b=current_gen_str,
+            config=config,
+            model=args.judge_model,
+            temperature=args.judge_temperature,
+            max_tokens=args.judge_max_tokens,
+            best_of_n=args.best_of_n
+        )
+        judgments.append(judgment)
+
+        gen_lens.append(current_response.shape[1])
+        gen_lens.append(alternative_response.shape[1])
+        
+        logger.info(f'\t\tmismatches in total: {len(mismatch_indices)}, mismatches = {mismatch_indices[:15]}...')
+        
+        if judgment['score'] not in target_token_is_important_verdicts:
             changed_token_indices.append((mismatch_index, False, current_response[0, mismatch_index].item(), alternative_response[0, mismatch_index].item()))
             current_response = alternative_response
+            logger.info('\t\tNot Important')
         else:
             changed_token_indices.append((mismatch_index, True, current_response[0, mismatch_index].item(), alternative_response[0, mismatch_index].item()))
+            logger.info('\t\tImportant')
         left_border = mismatch_index + 1
         responses.append(current_response.cpu().clone())
 
-        if tokenizer.eos_token_id in alternative_response[0, n_input_tokens:mismatch_index + 1].cpu().tolist():
-            logger.info(f'\t\t\t EOS found in alternative_response, terminating')
-            logger.info(f'\t\t\t alternative_response prefix: {tokenizer.decode(alternative_response[:, n_input_tokens:n_input_tokens + 16][0])}')
-            logger.info(f'\t\t\t alternative_response suffix: {tokenizer.decode(alternative_response[:, -16:][0])}')
-            break
-
-
-    return dict(changed_token_indices=changed_token_indices, colored_tokens=colored_tokens, draft_answer=draft_ans, target_answer=target_ref_ans, current_response=current_response, responses=responses)
+    return dict(changed_token_indices=changed_token_indices, colored_tokens=colored_tokens, draft_gen=draft_response.cpu(), target_gen=target_response.cpu(), current_response=current_response, responses=responses, gen_lens=gen_lens, draft_vs_target_judgment=draft_vs_target_judgment, target_gen_str=target_gen_str, draft_gen_str=draft_gen_str, judgments=judgments)
 
 
 def verify_args(args):
     assert args.process_id < args.world_size, "--process_id must be < --world_size"
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Arguments for important tokens selection algorithm")
@@ -163,18 +190,14 @@ def get_args():
                         help='Path or identifier of the target model.')
     parser.add_argument('--torch_dtype', type=str, choices=['float32', 'auto'], default='float32',
                         help='Data type for torch tensors.')
-    parser.add_argument('--gsm8k_train_path', type=str,
+    parser.add_argument('--arena_hard_questions_path', type=str, default='arena_hard_auto/data/arena-hard-v2.0/question.jsonl',
                         help='Path to the GSM8K train dataset JSON file.')
     parser.add_argument('--random_seed', type=int, default=42,
                         help='Random seed for reproducibility.')
-    parser.add_argument('--max_new_tokens', type=int, default=2048,
+    parser.add_argument('--max_new_tokens', type=int, default=4096 * 2,
                         help='Maximum number of new tokens to generate.')
     parser.add_argument('--output_folder', type=str, default='output',
                         help='Output folder name.')
-    parser.add_argument('--output_file', type=str, default='important_tokens',
-                        help='Output file name.')
-    parser.add_argument('--num_shots', type=int, default=0, choices=[0, 8],
-                        help='Number of shots to use.')
     parser.add_argument('--world_size', type=int, default=1,
                         help='world size')
     parser.add_argument('--process_id', type=int, default=0,
@@ -185,30 +208,41 @@ def get_args():
                         help='Write index offset.')
     parser.add_argument('--keep_responses', type=bool, default=False,
                         help='Keep all responses in find_important_tokens algorithm output.')
-    parser.add_argument('--process_saver_id', type=int, default=0)
-    parser.add_argument('--local_world_size', type=int, default=8)
+    parser.add_argument('--judge_model', type=str, default='gpt-4.1-mini')
+    parser.add_argument('--judge_temperature', type=float, default=0.0)
+    parser.add_argument('--judge_max_tokens', type=int, default=16000)
+    parser.add_argument('--shard_start', type=int, default=-1)
+    parser.add_argument('--shard_end', type=int, default=-1)
+    parser.add_argument('--best_of_n', type=int, default=3)
+    parser.add_argument('--saver', action='store_true')
 
     args = parser.parse_args()
     verify_args(args)
 
     return args
 
-def load_questions(args):
-    with open(args.gsm8k_train_path) as f:
-        gsm_questions = [json.loads(line) for line in f]
 
-    gsm_questions = [
-        {
-            'question': i['question'],
-            'answer': i['answer'][i['answer'].rfind('#### ') + 5:]
-        }
-        for i in gsm_questions
-    ]
+def load_questions(question_file: str):
+    """Load questions from a file."""
+    questions = []
+    with open(question_file, "r") as ques_file:
+        for line in ques_file:
+            if line:
+                questions.append(json.loads(line))
+    return questions
 
-    return gsm_questions
 
 if __name__ == "__main__":
     args = get_args()
+
+    logging.basicConfig(
+        level=logging.INFO, 
+        format=f"[Process {args.process_id}] %(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    logger = logging.getLogger(__name__)
+
+
     print('The script was run in the following way:')
     print("python script.py \\\n" + "\n".join(f"\t\t--{k} {v} \\" for k, v in vars(args).items()))
 
@@ -218,7 +252,6 @@ if __name__ == "__main__":
         device_map = 'auto'
     else:
         device_map = device
-
 
     np.random.seed(args.random_seed)
     draft_model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -230,36 +263,30 @@ if __name__ == "__main__":
     tokenizer.pad_token_id = 128004 # <|finetune_right_pad_id|>
     draft_model.generation_config.pad_token_id = target_model.generation_config.pad_token_id = tokenizer.pad_token_id
 
-    gsm_questions = load_questions(args)
-    logger.info(f'Read {len(gsm_questions)} questions from {args.gsm8k_train_path}')
+    questions = load_questions(args.arena_hard_questions_path)
+    config = make_config('arena_hard_auto/config/arena-hard-v2.0.yaml')
 
-    n_samples = len(gsm_questions)
+    logger.info(f'Read {len(questions)} questions from {args.arena_hard_questions_path}')
+
+    n_samples = len(questions)
     shard_len = (n_samples + args.world_size - 1) // args.world_size
     shard_start = args.process_id * shard_len
     shard_end = min((args.process_id + 1) * shard_len, n_samples)
+
+    if args.shard_start != -1 and args.shard_end != -1:
+        n_samples = args.shard_end - args.shard_start
+        shard_len = (n_samples + 8 - 1) // 8
+        shard_start = args.shard_start + (args.process_id % 8) * shard_len
+        shard_end = args.shard_start + min((((args.process_id % 8) + 1)) * shard_len, n_samples)
+
     logger.info(f'Process {args.process_id} {n_samples=}, {args.world_size=}, {shard_len=}, {shard_start=}, {shard_end=}')
     logger.info(f'Process {args.process_id} will process {shard_end - shard_start} questions: [{shard_start}; {shard_end})')
-
-    if args.num_shots == 0:
-        prompt_with_shots = GSM8KPrompts.prompt_with_0_shots
-        logger.info(f'{args.num_shots=}, using prompt_with_0_shots')
-    else:
-        prompt_with_shots = GSM8KPrompts.prompt_with_8_shots
-        logger.info(f'{args.num_shots=}, using prompt_with_8_shots')
 
     if not os.path.exists(args.output_folder):
         os.makedirs(args.output_folder)
         logger.info(f'Created output folder {args.output_folder}')
     else:
         logger.info(f'Output folder {args.output_folder} already exists')
-
-    output_file_path = os.path.join(args.output_folder, args.output_file + f'_{args.process_id}.pt')
-    if os.path.exists(output_file_path):
-        important_tokens_data = torch.load(output_file_path)
-        logger.info(f'Loaded {len(important_tokens_data)} important tokens from {output_file_path}, starting from {shard_start + len(important_tokens_data)}-th sample')
-    else:
-        important_tokens_data = []
-        logger.info(f'No important tokens found in {output_file_path}, will generate them')
 
     if 'NV_YT_OPERATION_ID' in os.environ:
         logger.info('NY_YT_OPERATION_ID found in os.environ')
@@ -268,14 +295,12 @@ if __name__ == "__main__":
 
     ##### FAST REBUTTAL QWEN PATCH START #####
 
-
-
     if 'qwen' in args.target_model.lower():
         tokenizer.bos_token_id = tokenizer.eos_token_id # based on: https://huggingface.co/Qwen/Qwen2-7B-Instruct/discussions/15
         with open("data/qwens/gsm8k-cot-llama.yaml", "r") as f:
             config = yaml.safe_load(f)
 
-        fewshot_samples = config.get("fewshot_config", {}).get("samples", []) if args.num_shots == 8 else []
+        fewshot_samples = config.get("fewshot_config", {}).get("samples", [])
 
         format_prompt = (
             "Given the following problem, reason and give a final answer to the problem.\n"
@@ -302,78 +327,49 @@ if __name__ == "__main__":
 
     if shard_end > shard_start:
         with tqdm(total=shard_end - shard_start) as pbar:
-            pbar.update(len(important_tokens_data))
-            for sample_idx in range(shard_start + len(important_tokens_data), shard_end):            
-                question_sample = gsm_questions[sample_idx]
-                answer = question_sample['answer']
-                question = question_sample['question']
-                prompt = prompt_with_shots + question + "\n" + GSM8KPrompts.formatting_prompt + llama_assistant_turn_end
-                batch_input_ids = tokenizer(prompt, return_tensors='pt', add_special_tokens=False)['input_ids'].to(device)
+            for sample_idx in range(shard_start, shard_end):     
+                file_path = os.path.join(args.output_folder, f'Task_{sample_idx}.pt')
+
+                if os.path.exists(file_path):
+                    logging.info(f'{file_path} exists, skipping {sample_idx} sample')
+                    pbar.update(1)
+                    continue
+
+                prompt = questions[sample_idx]['prompt']
+
+                batch_input_ids = tokenizer.apply_chat_template([
+                    {'role': 'user', 'content': prompt},
+                ], return_tensors='pt', tokenize=True, add_generation_prompt=True).to(device)
                 
                 ##### FAST REBUTTAL QWEN PATCH START #####
                 if 'qwen' in args.target_model.lower():
-                    gsm_prompt_start = "Given the following problem, reason and give a final answer to the problem.\nProblem:"
-
-                    prompt = gsm_prompt_start + " " + question + "\n" + GSM8KPrompts.formatting_prompt
-
-                    batch_input_ids = tokenizer.apply_chat_template(
-                        few_shot_turns + \
-                        [{'role': 'user', 'content': prompt}]
-                    , return_tensors='pt', add_generation_prompt=True, tokenize=True).to(device)
+                    raise ValueError("Qwen isn't supported for arena_hard_auto for now")
                 ##### FAST REBUTTAL QWEN PATCH END #####
 
 
                 important_tokens_dict = find_important_tokens(
-                    batch_input_ids, tokenizer=tokenizer, draft_model=draft_model, target_model=target_model)
-                
-                if not args.keep_responses:
+                    batch_input_ids, 
+                    tokenizer=tokenizer, 
+                    draft_model=draft_model, 
+                    target_model=target_model, 
+                    logger=logger,
+                    question=questions[sample_idx],
+                    config=config,
+                    args=args
+                )
+
+                important_tokens_dict['uid'] = questions[sample_idx]['uid']
+
+                if not args.keep_responses and 'responses' in important_tokens_dict:
                     del important_tokens_dict['responses']
 
                 important_tokens_dict['id'] = sample_idx + args.write_index_offset
 
-                important_tokens_data.append(important_tokens_dict)
-
-                if ((sample_idx % args.dump_freq == (args.dump_freq - 1)) or (sample_idx == shard_end - 1)):
-                    torch.save(important_tokens_data, output_file_path)
+                torch.save(important_tokens_dict, file_path)
 
                 pbar.update(1)
                 pbar.set_description(f'Process {args.process_id}')
     else:
-        torch.save(important_tokens_data, output_file_path)
+        logger.info(f'Process {args.process_id} has no samples to process')
 
-    done_file = os.path.join(args.output_folder, f"done_{args.process_id}.txt")
-    with open(done_file, "w") as f:
-        f.write("done\n")
-    logger.info(f"Process {args.process_id} has finished. Created {done_file}")
 
-    if args.process_id == args.process_saver_id and args.world_size > 1:
-        logger.info(f"Process {args.process_saver_id} is waiting for all other processes to finish...")
-        while True:
-            print("Process-saver tries to save snapshot:")
-            done_files = [f"done_{i}.txt" for i in range(args.process_saver_id + 1, args.process_saver_id + args.local_world_size)]
-            print(f"{done_files=}")
-            print(f"Done files:\n{[os.path.exists(os.path.join(args.output_folder, f)) for f in done_files]}")
-            all_done = all(os.path.exists(os.path.join(args.output_folder, f)) for f in done_files)
-
-            if all_done:
-                logger.info("All processes finished. Concatenating important tokens data...")
-                all_data = []
-                for i in range(args.process_saver_id, args.process_saver_id + args.local_world_size):
-                    # if i * shard_len >= shard_end:
-                    #     continue
-                    process_output_file = os.path.join(args.output_folder, f"{args.output_file}_{i}.pt")
-                    all_data.extend(torch.load(process_output_file))
-                    logger.info(f"Removing {process_output_file}")
-                    os.remove(process_output_file)
-
-                    done_file = os.path.join(args.output_folder, f"done_{i}.txt")
-                    logger.info(f"Removing {done_file}")
-                    os.remove(done_file)
-
-                final_output_file_path = os.path.join(args.output_folder, args.output_file + f'_{args.process_saver_id}' + '.pt')
-                logger.info(f"Saving important tokens data to {final_output_file_path}...")
-                torch.save(all_data, final_output_file_path)
-                logger.info("Done.")
-                break
-
-            time.sleep(5)

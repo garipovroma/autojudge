@@ -1,7 +1,3 @@
-'''
-Code from https://github.com/yandexdataschool/gpu_parallel
-'''
-
 import argparse
 import subprocess
 import math
@@ -13,6 +9,7 @@ from threading import Lock, Thread
 from typing import Sequence, Any
 
 import rpyc
+
 
 class TaskQueue(rpyc.Service):
     """
@@ -123,6 +120,9 @@ def main():
     parser.add_argument("--use_queue", action="store_true")
     parser.add_argument("--extra_args", type=str, default="",
                         help="Additional arguments to pass to the script that is going to be gpu parallelized")
+    parser.add_argument("--gpus_per_script", type=int, default=1,
+                        help="Number of gpus per inner script (defined how many child processes are started)")
+
     args = parser.parse_args()
 
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -132,7 +132,10 @@ def main():
 
     gpus = visible_devices.split(",")
     n_gpus = len(gpus)
-    logger.info(f"Number of GPUs: {n_gpus}")
+    gpus_per_script = args.gpus_per_script
+    logger.info(f"Number of GPUs: {n_gpus}, GPUs per script: {gpus_per_script}")
+
+    assert n_gpus % gpus_per_script == 0, 'Number of gpus should be divisible by the number of gpus per script!'
 
     total = args.end - args.start
     logger.info(f"Processing samples [{args.start}; {args.end})")
@@ -143,21 +146,24 @@ def main():
     else:
         logger.info(f"Chunk size (per process): {math.ceil(total / n_gpus)}")
 
+
     processes = []
-    for i, gpu_id in enumerate(gpus):
+    for i, gpu_idx in enumerate(range(0, n_gpus - gpus_per_script + 1, gpus_per_script)):
+        gpus_for_script = ','.join(map(str, gpus[gpu_idx:gpu_idx+gpus_per_script])).strip()
+
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu_id.strip()
+        env["CUDA_VISIBLE_DEVICES"] = gpus_for_script
         env["GPU_PARALLEL_PROCESS_ID"] = str(i)
         if args.use_queue:
             cmd = f"python3 {args.script} --queue {queue.endpoint} --total_tasks {args.end - args.start} {args.extra_args}"
         else:
-            chunk_size = chunk_size = math.ceil(total / n_gpus)
+            chunk_size = chunk_size = math.ceil(total / n_gpus / gpus_per_script)
             chunk_start = args.start + i * chunk_size
             chunk_end = min(args.start + (i + 1) * chunk_size, args.end)
             if chunk_start >= args.end:
                 break
             cmd = f"python3 {args.script} --start {chunk_start} --end {chunk_end} {args.extra_args}"
-        logger.info(f"Launching on GPU {gpu_id.strip()}: {cmd}")
+        logger.info(f"Launching on GPU {gpus_for_script}: {cmd}")
         processes.append(subprocess.Popen(cmd, shell=True, env=env))
 
     error_occurred = wait_for_done_or_error(*processes)

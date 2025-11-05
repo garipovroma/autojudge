@@ -1,10 +1,10 @@
-transformers==4.46.1
+accelerate==1.1.0
+datasets
 torch==2.5.1
-scikit-learn==1.5.2
-numpy==1.26.4
-pandas
-rpyc==6.0.1
+transformers==4.48.0
 tqdm
 termcolor
-accelerate
-datasets
+numpy==1.26.4
+pandas
+scikit-learn==1.5.2
+rpyc==6.0.1

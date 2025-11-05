@@ -21,7 +21,7 @@ import logging
 
 from src.livecodebench_v5 import load_code_generation_dataset, extract_code, apply_llama_lcb_prompt_format, codegen_metrics, unpack_lcb_data
 
-from generation_utils import run_spec_dec_top_k
+from generation_utils import run_spec_dec
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Eval baselines")
@@ -47,7 +47,7 @@ def parse_args():
         "--save_folder",
         type=str,
         default='.',
-        help='Results will be written to "args.eval_folder/evals_data/limo/exp_name"
+        help='Results will be written to "args.eval_folder/evals_data/limo/exp_name".'
     )
     parser.add_argument(
         "--dump_snapshot_freq",
@@ -72,17 +72,21 @@ def parse_args():
     parser.add_argument("--random_seed", default=42, type=int)
     parser.add_argument("--max_new_tokens", default=2048, type=int)
     parser.add_argument("--window_size", default=16, type=int)
-    parser.add_argument("--K", type=int, default=1)
+    parser.add_argument("--head_threshold", type=float)
     parser.add_argument("--setup", default='DD-DT')
     parser.add_argument("--split_path", type=str)
     parser.add_argument('--n_tasks', type=int, default=880)
     parser.add_argument('--num_process_evaluate', type=int, default=64)
     parser.add_argument('--lcb_path', type=str, default='none')
+    parser.add_argument("--setup", default='DD-DT', choices=['DD-DT', 'DT'])
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.bench_name = 'LCB'
+
+    return args
 
 
-def load_head(args: 'args_dataclass'):
+def load_head(args):
     checkpoint_dict = pd.read_pickle(args.head_path)
     head = checkpoint_dict['model']
     scaler = checkpoint_dict['scaler']
@@ -103,7 +107,7 @@ def load_head(args: 'args_dataclass'):
 
 
 
-def load_models(args: 'args_dataclass', device: torch.device):
+def load_models(args, device: torch.device):
     draft_model = transformers.AutoModelForCausalLM.from_pretrained(
         args.draft_model, torch_dtype=args.torch_dtype, device_map=device, low_cpu_mem_usage=True)
 
@@ -122,9 +126,9 @@ def test_program(program_tokens, eval_samples, tokenizer):
     score = int(result[0]['pass@1'])
     return dict(score=score, code=code, gen=tokenizer.batch_decode(program_tokens)[0], result=result)
 
-def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model, draft_model, tokenizer, scaler, K, args: 'args_dataclass', eval_sample):
+def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model, draft_model, tokenizer, scaler, head, args, eval_sample):
     batch_input_ids = tokenizer(question_sample, add_special_tokens=False, return_tensors='pt').to(device)['input_ids']
-    run_stats = run_spec_dec_top_k(batch_input_ids, target_model, draft_model, tokenizer, scaler, K, args, setup=args.setup)
+    run_stats = run_spec_dec(batch_input_ids, target_model, draft_model, tokenizer, scaler, head, args, setup=args.setup)
 
     generation = run_stats['current_gen']
 
@@ -158,7 +162,7 @@ def run_spec_dec_collect_stats(sample_idx, question_sample, device, target_model
             'raw_accepts_levi': accepts_levi,
             'mismatches': mismatches,  # keeping only first mismatch in the drafting window,
             'generation_str': generation_str,
-            'k': args.K,
+            'thr': args.head_threshold,
         }
     return stats_dict
     
@@ -170,12 +174,12 @@ def filter_by_ids(dataset, ids):
     filtered_dataset = [i for i in dataset if i.question_id in ids]
     return filtered_dataset
 
-def main():
+def main(args):
     rank = get_worker_rank()
     device = torch.device('cuda')  # gpu_parallel already sets CUDA_VISIBLE_DEVICES for you
     logger = init_worker_logger()
     logger.info(f'The script was run in the following way:')
-    logger.info(f"python {__file__} \\\n" + "\n".join(f"\t\t--{k} {v} \\" for k, v in vars(args).items()))
+    logger.info(f"python {__file__} \\\n" + "\n".join(f"\t\t--{k} {v} \\" for k, v in vars(args).items() if k != 'bench_name'))
     logger.info(f'Output directory: {args.save_folder}')
 
     if not os.path.exists(args.save_folder):
@@ -197,7 +201,7 @@ def main():
     local_tasks_solved = 0
 
     head, scaler = load_head(args)
-    np.random.seed(args_dataclass.random_seed)
+    np.random.seed(args.random_seed)
 
     def _run_task(idx: int):
         nonlocal local_tasks_solved
@@ -217,8 +221,8 @@ def main():
             draft_model=draft_model,
             tokenizer=tokenizer,
             scaler=scaler,
-            K=args_dataclass.K,
-            args=args_dataclass,
+            head=head,
+            args=args,
             eval_sample=eval_sample
         )
 
@@ -231,7 +235,7 @@ def main():
 
     if args.start is not None and args.end is not None and args.queue is None:
         logger.info(f'Generating tasks [{args.start}; {args.end})')
-        for idx in tqdm(range(args.start, args.end), desc=f'Process {rank}', total=args.end-args.start+1):
+        for idx in tqdm(range(args.start, args.end), desc=f'Process {rank}', total=args.end-args.start):
             _run_task(idx)
     elif args.queue is not None:
         logger.info(f'Generating tasks from {args.queue}')
@@ -246,19 +250,4 @@ def main():
 if __name__ == "__main__":
     args = parse_args()
 
-    class args_dataclass:
-        draft_model = args.draft_model
-        target_model = args.target_model
-        torch_dtype = args.torch_dtype
-        random_seed = args.random_seed
-        max_new_tokens = args.max_new_tokens
-        window_size = args.window_size
-        K = args.K
-        head_path = args.head_path
-        setup = args.setup
-        split_path = args.split_path
-        n_tasks = args.n_tasks
-        num_process_evaluate = args.num_process_evaluate
-        lcb_path = args.lcb_path
-
-    main()
+    main(args)

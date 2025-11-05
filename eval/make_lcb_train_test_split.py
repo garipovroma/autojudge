@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument('--n_tasks', type=int, default=880)
 
     args = parser.parse_args()
-    assert 1 <= args.val_size <= 880
+    assert 1 <= args.val_size <= 879
 
     return args
 
